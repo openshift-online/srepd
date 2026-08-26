@@ -32,7 +32,7 @@ build: ## Build the application
 .PHONY: install
 install: ## Install the application to $(GOPATH)/bin
 	@echo "Installing the application..."
-	go build -ldflags "-X github.com/clcollins/srepd/pkg/tui.GitSHA=$$(git rev-parse --short HEAD)" -o ${BIN_DIR}/srepd .
+	go build -ldflags "-X github.com/openshift-online/srepd/pkg/tui.GitSHA=$$(git rev-parse --short HEAD)" -o ${BIN_DIR}/srepd .
 
 .PHONY: install-local
 install-local: build ## Install the application locally to ~/.local/bin
@@ -224,7 +224,7 @@ test-coverage-patch: ## Check coverage of changed files (approximates Codecov pa
 	go test ./... -coverprofile=coverage.out -covermode=atomic > /dev/null 2>&1; \
 	FAIL=false; \
 	for f in $$CHANGED; do \
-		pkg=$$(dirname $$f | sed 's|^|github.com/clcollins/srepd/|'); \
+		pkg=$$(dirname $$f | sed 's|^|github.com/openshift-online/srepd/|'); \
 		cov=$$(go tool cover -func=coverage.out 2>/dev/null | grep "^$$pkg" | awk '{sum+=$$3; n++} END {if(n>0) printf "%.0f", sum/n; else print "N/A"}'); \
 		if [ "$$cov" != "N/A" ] && [ $$(echo "$$cov < $(PATCH_COVERAGE_TARGET)" | bc 2>/dev/null || echo 0) -eq 1 ]; then \
 			echo "  WARN: $$f package coverage $$cov% < $(PATCH_COVERAGE_TARGET)%"; \
