@@ -180,7 +180,11 @@ func (p *openaiCompatProvider) StreamQuery(ctx context.Context, systemPrompt str
 		}
 
 		if len(chunk.Choices) > 0 && chunk.Choices[0].Delta.Content != "" {
-			ch <- chunk.Choices[0].Delta.Content
+			select {
+			case ch <- chunk.Choices[0].Delta.Content:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}
 	}
 

@@ -1124,8 +1124,7 @@ func TestReadAgentSessionCmd_PrefersEventsOverDone(t *testing.T) {
 		events <- agent.Event{Kind: agent.Result, Text: "final answer"}
 		close(done)
 
-		s := &agent.Session{}
-		agent.SetTestChannels(s, events, done)
+		s := agent.NewSessionWithChannels(events, done)
 
 		cmd := readAgentSessionCmd(s)
 		msg := cmd()

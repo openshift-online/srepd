@@ -147,7 +147,11 @@ func (p *ollamaProvider) StreamQuery(ctx context.Context, systemPrompt string, u
 		}
 
 		if chunk.Message.Content != "" {
-			ch <- chunk.Message.Content
+			select {
+			case ch <- chunk.Message.Content:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}
 
 		if chunk.Done {

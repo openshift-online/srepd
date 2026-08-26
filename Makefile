@@ -262,6 +262,11 @@ test-fixtures: ## Check that fixture data contains no real UUIDs, domains, or or
 	fi; \
 	echo "All fixture data is properly sanitized."
 
+.PHONY: deadcode
+deadcode: ## Report unreachable functions (informational; not part of test-all or CI)
+	@echo "Running deadcode analysis (informational)..."
+	@go run golang.org/x/tools/cmd/deadcode@v0.49.0 ./... || true
+
 .PHONY: test-fuzz
 test-fuzz: ## Run property-based state machine tests (not in test-all; slower, finds edge cases)
 	@echo "Running property-based state machine tests..."

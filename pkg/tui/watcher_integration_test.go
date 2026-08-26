@@ -278,13 +278,15 @@ func TestWatcherSynthesisMsg_Error(t *testing.T) {
 
 func TestTypewriterTickMsg(t *testing.T) {
 	m := createTestModel()
+	m.typewriterGen = 7
 	m.typewriter = &typewriterState{
 		words:  []string{"hello", "world", "foo"},
 		marker: "🤖 ",
+		gen:    7,
 	}
 	m.watcherBuffer.Append("")
 
-	result, cmd := m.Update(typewriterTickMsg{})
+	result, cmd := m.Update(typewriterTickMsg{gen: 7})
 	updated := result.(model)
 
 	assert.Contains(t, updated.watcherBuffer.Content(), "hello")
@@ -506,16 +508,18 @@ func TestBuildClusterContext(t *testing.T) {
 func TestAdvanceTypewriter(t *testing.T) {
 	m := createTestModel()
 	m.watcherBuffer.Append("")
+	m.typewriterGen = 1
 	m.typewriter = &typewriterState{
 		words:  []string{"one", "two", "three", "four", "five"},
 		marker: "📡 ",
+		gen:    1,
 	}
 
-	cmd := m.advanceTypewriter()
+	cmd := m.advanceTypewriter(1)
 	assert.NotNil(t, cmd, "should return tick for remaining words")
 	assert.Contains(t, m.watcherBuffer.Content(), "one")
 
-	cmd = m.advanceTypewriter()
+	cmd = m.advanceTypewriter(1)
 	if m.typewriter == nil {
 		assert.Nil(t, cmd, "nil when done")
 	}
@@ -525,7 +529,7 @@ func TestAdvanceTypewriter_Nil(t *testing.T) {
 	m := createTestModel()
 	m.typewriter = nil
 
-	cmd := m.advanceTypewriter()
+	cmd := m.advanceTypewriter(1)
 	assert.Nil(t, cmd)
 }
 

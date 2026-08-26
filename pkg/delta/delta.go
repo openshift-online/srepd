@@ -40,11 +40,15 @@ func (k ChangeKind) String() string {
 	}
 }
 
-// Change represents a single state transition for an incident.
+// Change represents a single state transition for an incident. At records
+// when the change was observed; it is supplied by the caller of Diff so the
+// package stays clock-free and testable. A zero At means "unknown" and is
+// rendered without an age.
 type Change struct {
 	Kind       ChangeKind
 	IncidentID string
 	Summary    string
+	At         time.Time
 }
 
 // Snapshot captures the fingerprint-relevant fields of an incident at a point
@@ -79,10 +83,12 @@ func SnapshotFromFields(id, title, service, status, urgency string, noteCount, a
 }
 
 // Diff computes changes between prev and curr snapshots. Pure function: values
-// in, values out, no I/O. First-sighting semantics: a snapshot in curr with no
-// match in prev produces IncidentNew. A snapshot in prev with no match in curr
+// in, values out, no I/O — now is passed in rather than read from the clock so
+// the function stays deterministic. Every returned Change carries now as its
+// observation time. First-sighting semantics: a snapshot in curr with no match
+// in prev produces IncidentNew. A snapshot in prev with no match in curr
 // produces IncidentResolved.
-func Diff(prev, curr []Snapshot) []Change {
+func Diff(prev, curr []Snapshot, now time.Time) []Change {
 	prevMap := make(map[string]Snapshot, len(prev))
 	for _, s := range prev {
 		prevMap[s.ID] = s
@@ -103,6 +109,7 @@ func Diff(prev, curr []Snapshot) []Change {
 				Kind:       IncidentNew,
 				IncidentID: c.ID,
 				Summary:    fmt.Sprintf("New incident: %s (%s)", c.Title, c.Service),
+				At:         now,
 			})
 			continue
 		}
@@ -111,6 +118,7 @@ func Diff(prev, curr []Snapshot) []Change {
 				Kind:       IncidentUpdated,
 				IncidentID: c.ID,
 				Summary:    fmt.Sprintf("Title changed: %s → %s", p.Title, c.Title),
+				At:         now,
 			})
 		}
 		if p.Service != c.Service {
@@ -118,6 +126,7 @@ func Diff(prev, curr []Snapshot) []Change {
 				Kind:       IncidentUpdated,
 				IncidentID: c.ID,
 				Summary:    fmt.Sprintf("Service changed: %s → %s", p.Service, c.Service),
+				At:         now,
 			})
 		}
 		if p.Status != c.Status {
@@ -125,6 +134,7 @@ func Diff(prev, curr []Snapshot) []Change {
 				Kind:       StatusChanged,
 				IncidentID: c.ID,
 				Summary:    fmt.Sprintf("Status changed: %s → %s", p.Status, c.Status),
+				At:         now,
 			})
 		}
 		if p.Urgency != c.Urgency {
@@ -132,6 +142,7 @@ func Diff(prev, curr []Snapshot) []Change {
 				Kind:       UrgencyChanged,
 				IncidentID: c.ID,
 				Summary:    fmt.Sprintf("Urgency changed: %s → %s", p.Urgency, c.Urgency),
+				At:         now,
 			})
 		}
 		if p.NoteCount != nil && c.NoteCount != nil && *c.NoteCount > *p.NoteCount {
@@ -140,6 +151,7 @@ func Diff(prev, curr []Snapshot) []Change {
 				Kind:       NoteAdded,
 				IncidentID: c.ID,
 				Summary:    fmt.Sprintf("%d new note(s)", added),
+				At:         now,
 			})
 		}
 		if p.AlertCount != nil && c.AlertCount != nil && *c.AlertCount > *p.AlertCount {
@@ -148,6 +160,7 @@ func Diff(prev, curr []Snapshot) []Change {
 				Kind:       AlertAdded,
 				IncidentID: c.ID,
 				Summary:    fmt.Sprintf("%d new alert(s)", added),
+				At:         now,
 			})
 		}
 	}
@@ -159,6 +172,7 @@ func Diff(prev, curr []Snapshot) []Change {
 				Kind:       IncidentResolved,
 				IncidentID: p.ID,
 				Summary:    fmt.Sprintf("Resolved: %s", p.Title),
+				At:         now,
 			})
 		}
 	}
@@ -166,8 +180,34 @@ func Diff(prev, curr []Snapshot) []Change {
 	return changes
 }
 
+// relativeTime renders how long ago at occurred relative to now, e.g. "3m
+// ago". It returns the empty string when either timestamp is unknown (zero),
+// and "just now" for sub-second and future timestamps — a change stamped in
+// the future means clock skew, not a negative age.
+func relativeTime(at, now time.Time) string {
+	if at.IsZero() || now.IsZero() {
+		return ""
+	}
+
+	d := now.Sub(at)
+	switch {
+	case d < time.Second:
+		return "just now"
+	case d < time.Minute:
+		return fmt.Sprintf("%ds ago", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
+	}
+}
+
 // Narrate formats changes into a compact narrative block for the LLM.
-// Pure function: changes + reference time in, string out.
+// Pure function: changes + reference time in, string out. The reference time
+// ages each change relative to now; changes with no timestamp are rendered
+// without an age.
 func Narrate(changes []Change, now time.Time) string {
 	if len(changes) == 0 {
 		return ""
@@ -175,7 +215,11 @@ func Narrate(changes []Change, now time.Time) string {
 
 	var lines []string
 	for _, c := range changes {
-		lines = append(lines, fmt.Sprintf("- [%s] %s: %s", c.IncidentID, c.Kind, c.Summary))
+		line := fmt.Sprintf("- [%s] %s: %s", c.IncidentID, c.Kind, c.Summary)
+		if rel := relativeTime(c.At, now); rel != "" {
+			line += " (" + rel + ")"
+		}
+		lines = append(lines, line)
 	}
 
 	const maxLines = 20

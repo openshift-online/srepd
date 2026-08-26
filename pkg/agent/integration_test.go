@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -680,22 +682,79 @@ func TestIndex_RecordDoesNotBlockHas(t *testing.T) {
 }
 
 // FIX 3: scanner.Err() must be checked after the load loop.
-func TestIndex_ScannerErrChecked(t *testing.T) {
+//
+// A scanner error means the file was only partially read. Compacting on a
+// partial read would rewrite index.jsonl from the entries load() happened to
+// see and silently discard every entry past the failure point — data loss.
+// load() must detect the error and return before reaching compaction.
+//
+// The error is provoked with a line longer than bufio.Scanner's default
+// 64 KiB token limit (bufio.MaxScanTokenSize); index.go never calls
+// scanner.Buffer(), so Scan() stops with bufio.ErrTooLong.
+func TestIndex_ScannerErrorSkipsCompaction(t *testing.T) {
 	tmpDir := t.TempDir()
 	sessionDir := filepath.Join(tmpDir, "sessions")
 	require.NoError(t, os.MkdirAll(sessionDir, 0755))
-
 	indexPath := filepath.Join(sessionDir, "index.jsonl")
-	sid := SessionIDFor("INC-001").String()
-	goodLine := fmt.Sprintf(
-		`{"incident_id":"INC-001","session_id":"%s","created":"2026-01-01T00:00:00Z","last_used":"2026-01-01T00:00:00Z"}`,
-		sid)
-	// Write a good line followed by a valid but complete file — no scanner error
-	require.NoError(t, os.WriteFile(indexPath, []byte(goodLine+"\n"), 0600))
+
+	// Well past bufio.MaxScanTokenSize (64 KiB) so Scan() fails with ErrTooLong.
+	oversized := `{"incident_id":"INC-HUGE","session_id":"` +
+		strings.Repeat("A", bufio.MaxScanTokenSize+1024) + `"}`
+
+	// Enough total lines that compaction WOULD fire (> indexCompactionThreshold)
+	// if the scanner error were ignored. The oversized line comes first, so a
+	// compacting rewrite would drop everything after it.
+	var lines []string
+	lines = append(lines, entryLine(t, "INC-FIRST", SessionIDFor("INC-FIRST")))
+	lines = append(lines, oversized)
+	for i := 0; i < indexCompactionThreshold+50; i++ {
+		lines = append(lines, entryLine(t, fmt.Sprintf("INC-%04d", i), uuid.New()))
+	}
+	require.NoError(t,
+		os.WriteFile(indexPath, []byte(strings.Join(lines, "\n")+"\n"), 0600))
+
+	before, err := os.ReadFile(indexPath)
+	require.NoError(t, err)
+	beforeLineCount := len(lines)
+
+	// Sanity check: the fixture really does provoke a scanner error, and it
+	// really does stop the scan early. Without this the test could pass for
+	// the wrong reason (e.g. if the limit were ever raised).
+	f, err := os.Open(indexPath)
+	require.NoError(t, err)
+	scanner := bufio.NewScanner(f)
+	scanned := 0
+	for scanner.Scan() {
+		scanned++
+	}
+	require.ErrorIs(t, scanner.Err(), bufio.ErrTooLong,
+		"fixture must provoke bufio.ErrTooLong")
+	require.NoError(t, f.Close())
+	require.Less(t, scanned, beforeLineCount,
+		"the scanner must stop early, leaving entries unread")
 
 	idx := newSessionIndex(sessionDir)
-	assert.Equal(t, 1, len(idx.established),
-		"good entry must be loaded")
+
+	// (a) The scanner error was detected: load() bailed out before compaction,
+	// so only the entries read before the oversized line are in memory.
+	idx.mu.Lock()
+	loaded := len(idx.established)
+	idx.mu.Unlock()
+	assert.Equal(t, 1, loaded,
+		"load() must stop at the scanner error, keeping only entries read before it")
+	assert.True(t, idx.has("INC-FIRST"), "the entry read before the error is retained")
+
+	// (b) Compaction did NOT run: the file is byte-identical, proving the
+	// entries beyond the oversized line were not compacted away.
+	after, err := os.ReadFile(indexPath)
+	require.NoError(t, err)
+	assert.Equal(t, string(before), string(after),
+		"a scanner error must abort compaction and leave index.jsonl untouched")
+	assert.Equal(t, beforeLineCount, len(readIndexLines(t, indexPath)),
+		"line count must be unchanged — no entries discarded")
+
+	// No temp file may be left behind either.
+	assertNoTempFiles(t, sessionDir)
 }
 
 // TestRevertCheck_StubIndexWrite is the 410a §2c revert check: with

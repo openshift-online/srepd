@@ -15,7 +15,7 @@ func TestDiff_NoChange(t *testing.T) {
 		{ID: "P1", Title: "Alert A", Service: "svc-a", Status: "triggered", Urgency: "high"},
 		{ID: "P2", Title: "Alert B", Service: "svc-b", Status: "acknowledged", Urgency: "low"},
 	}
-	changes := Diff(snaps, snaps)
+	changes := Diff(snaps, snaps, testNow)
 	assert.Empty(t, changes, "identical snapshots must produce no changes")
 }
 
@@ -27,7 +27,7 @@ func TestDiff_NewIncident(t *testing.T) {
 		{ID: "P1", Title: "Alert A", Service: "svc-a", Status: "triggered", Urgency: "high"},
 		{ID: "P2", Title: "New Alert", Service: "svc-b", Status: "triggered", Urgency: "high"},
 	}
-	changes := Diff(prev, curr)
+	changes := Diff(prev, curr, testNow)
 	require.Len(t, changes, 1)
 	assert.Equal(t, IncidentNew, changes[0].Kind)
 	assert.Equal(t, "P2", changes[0].IncidentID)
@@ -42,7 +42,7 @@ func TestDiff_IncidentResolved(t *testing.T) {
 	curr := []Snapshot{
 		{ID: "P1", Title: "Alert A", Service: "svc-a", Status: "triggered", Urgency: "high"},
 	}
-	changes := Diff(prev, curr)
+	changes := Diff(prev, curr, testNow)
 	require.Len(t, changes, 1)
 	assert.Equal(t, IncidentResolved, changes[0].Kind)
 	assert.Equal(t, "P2", changes[0].IncidentID)
@@ -55,7 +55,7 @@ func TestDiff_StatusChange(t *testing.T) {
 	curr := []Snapshot{
 		{ID: "P1", Title: "Alert A", Service: "svc-a", Status: "acknowledged", Urgency: "high"},
 	}
-	changes := Diff(prev, curr)
+	changes := Diff(prev, curr, testNow)
 	require.Len(t, changes, 1)
 	assert.Equal(t, StatusChanged, changes[0].Kind)
 	assert.Contains(t, changes[0].Summary, "triggered")
@@ -69,7 +69,7 @@ func TestDiff_UrgencyChange(t *testing.T) {
 	curr := []Snapshot{
 		{ID: "P1", Title: "Alert A", Service: "svc-a", Status: "triggered", Urgency: "high"},
 	}
-	changes := Diff(prev, curr)
+	changes := Diff(prev, curr, testNow)
 	require.Len(t, changes, 1)
 	assert.Equal(t, UrgencyChanged, changes[0].Kind)
 	assert.Contains(t, changes[0].Summary, "low")
@@ -83,7 +83,7 @@ func TestDiff_TitleChanged(t *testing.T) {
 	curr := []Snapshot{
 		{ID: "P1", Title: "New Title", Service: "svc-a", Status: "triggered", Urgency: "high"},
 	}
-	changes := Diff(prev, curr)
+	changes := Diff(prev, curr, testNow)
 	require.Len(t, changes, 1)
 	assert.Equal(t, IncidentUpdated, changes[0].Kind)
 	assert.Contains(t, changes[0].Summary, "Old Title")
@@ -97,7 +97,7 @@ func TestDiff_ServiceChanged(t *testing.T) {
 	curr := []Snapshot{
 		{ID: "P1", Title: "Alert", Service: "svc-new", Status: "triggered", Urgency: "high"},
 	}
-	changes := Diff(prev, curr)
+	changes := Diff(prev, curr, testNow)
 	require.Len(t, changes, 1)
 	assert.Equal(t, IncidentUpdated, changes[0].Kind)
 	assert.Contains(t, changes[0].Summary, "svc-old")
@@ -111,7 +111,7 @@ func TestDiff_NoteAdded(t *testing.T) {
 	curr := []Snapshot{
 		{ID: "P1", Title: "Alert A", Service: "svc-a", Status: "triggered", Urgency: "high", NoteCount: intPtr(4)},
 	}
-	changes := Diff(prev, curr)
+	changes := Diff(prev, curr, testNow)
 	require.Len(t, changes, 1)
 	assert.Equal(t, NoteAdded, changes[0].Kind)
 	assert.Contains(t, changes[0].Summary, "2 new note(s)")
@@ -124,7 +124,7 @@ func TestDiff_AlertAdded(t *testing.T) {
 	curr := []Snapshot{
 		{ID: "P1", Title: "Alert A", Service: "svc-a", Status: "triggered", Urgency: "high", AlertCount: intPtr(3)},
 	}
-	changes := Diff(prev, curr)
+	changes := Diff(prev, curr, testNow)
 	require.Len(t, changes, 1)
 	assert.Equal(t, AlertAdded, changes[0].Kind)
 	assert.Contains(t, changes[0].Summary, "2 new alert(s)")
@@ -137,7 +137,7 @@ func TestDiff_MultipleChanges(t *testing.T) {
 	curr := []Snapshot{
 		{ID: "P1", Title: "Alert A", Service: "svc-a", Status: "acknowledged", Urgency: "high", NoteCount: intPtr(3), AlertCount: intPtr(2)},
 	}
-	changes := Diff(prev, curr)
+	changes := Diff(prev, curr, testNow)
 	assert.Len(t, changes, 4, "status + urgency + notes + alerts")
 }
 
@@ -148,7 +148,7 @@ func TestDiff_NilNoteCountSkipsComparison(t *testing.T) {
 	curr := []Snapshot{
 		{ID: "P1", Title: "A", Service: "svc", Status: "triggered", Urgency: "high", NoteCount: intPtr(5)},
 	}
-	changes := Diff(prev, curr)
+	changes := Diff(prev, curr, testNow)
 	for _, c := range changes {
 		assert.NotEqual(t, NoteAdded, c.Kind, "nil→known must not produce NoteAdded")
 	}
@@ -161,7 +161,7 @@ func TestDiff_NilAlertCountSkipsComparison(t *testing.T) {
 	curr := []Snapshot{
 		{ID: "P1", Title: "A", Service: "svc", Status: "triggered", Urgency: "high", AlertCount: intPtr(3)},
 	}
-	changes := Diff(prev, curr)
+	changes := Diff(prev, curr, testNow)
 	for _, c := range changes {
 		assert.NotEqual(t, AlertAdded, c.Kind, "nil→known must not produce AlertAdded")
 	}
@@ -174,7 +174,7 @@ func TestDiff_ZeroToNonZeroNoteCountDetected(t *testing.T) {
 	curr := []Snapshot{
 		{ID: "P1", Title: "A", Service: "svc", Status: "triggered", Urgency: "high", NoteCount: intPtr(1)},
 	}
-	changes := Diff(prev, curr)
+	changes := Diff(prev, curr, testNow)
 	require.Len(t, changes, 1)
 	assert.Equal(t, NoteAdded, changes[0].Kind, "genuine 0→1 must be detected")
 }
@@ -184,7 +184,7 @@ func TestDiff_FirstSighting(t *testing.T) {
 		{ID: "P1", Title: "Alert A", Service: "svc-a", Status: "triggered", Urgency: "high"},
 		{ID: "P2", Title: "Alert B", Service: "svc-b", Status: "triggered", Urgency: "low"},
 	}
-	changes := Diff(nil, curr)
+	changes := Diff(nil, curr, testNow)
 	assert.Len(t, changes, 2, "every incident on first sighting must produce IncidentNew")
 	for _, c := range changes {
 		assert.Equal(t, IncidentNew, c.Kind)
@@ -200,12 +200,12 @@ func TestDiff_ReorderingOnly(t *testing.T) {
 		{ID: "P2", Title: "B", Service: "svc", Status: "triggered", Urgency: "high"},
 		{ID: "P1", Title: "A", Service: "svc", Status: "triggered", Urgency: "high"},
 	}
-	changes := Diff(prev, curr)
+	changes := Diff(prev, curr, testNow)
 	assert.Empty(t, changes, "reordering without field changes must produce no changes")
 }
 
 func TestDiff_EmptyBoth(t *testing.T) {
-	changes := Diff(nil, nil)
+	changes := Diff(nil, nil, testNow)
 	assert.Empty(t, changes)
 }
 

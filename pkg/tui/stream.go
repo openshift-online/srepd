@@ -11,6 +11,12 @@ import (
 	"github.com/openshift-online/srepd/pkg/ai"
 )
 
+// streamChanBuffer sizes the token and event channels used while streaming a
+// provider response. Buffering keeps the producer goroutine off the Update
+// loop's cadence: it can run ahead between ticks rather than blocking on each
+// token.
+const streamChanBuffer = 64
+
 // streamEvent is a single item from a provider stream: either a token of text or a
 // terminal signal (done, with an optional error). Exactly one of these is delivered
 // per channel receive; the channel is closed after the terminal event.
@@ -67,11 +73,11 @@ func streamWatcherCmd(provider ai.Provider, systemPrompt, userPrompt, incidentCo
 		}
 
 		// Buffered so the producer goroutine is not blocked between Update ticks.
-		ch := make(chan streamEvent, 64)
+		ch := make(chan streamEvent, streamChanBuffer)
 
 		go func() {
 			defer cancel()
-			tokens := make(chan string, 64)
+			tokens := make(chan string, streamChanBuffer)
 
 			// StreamQuery closes tokens when done; run it and fan tokens into ch.
 			errCh := make(chan error, 1)

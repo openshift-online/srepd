@@ -109,6 +109,35 @@ use type assertions — no provider is forced to implement Chat.
 STATE changed; the dedup layer gates on whether the same OBSERVATION TEXT
 was already investigated within the cooldown window. Both are needed.
 
+## Lessons Learned (added by plan 422)
+
+**D5 `get_recent_events` never worked in production.** The tool was
+registered in `initToolRegistryForModel` with the closure
+`func() []delta.Change { return m.recentChanges }`. `Update` has a value
+receiver, so `computeAndStoreDeltas` appended to per-`Update` copies while
+the closure held the original struct's nil slice. The tool returned `[]`
+for the entire lifetime of every session.
+
+The D5 tests did not catch it because **they supplied the dependency they
+were meant to verify**: each passed its own `getChanges` closure into
+`RegisterDeltaTools` and asserted on the result, so they tested the
+handler's JSON shaping and never the wiring. Where a component is
+*registered* with a dependency, at least one test must obtain that
+dependency from the registry the production code built.
+
+Secondary issue: the handler runs on the investigation `tea.Cmd`
+goroutine, so even correct wiring would have been an unsynchronized read
+of a slice the main loop was appending to.
+
+Plan 422 (N1) replaces the field with a mutex-guarded `*delta.Log` — a
+pointer survives the value-receiver copies, and the mutex makes the
+cross-goroutine read safe.
+
+Also fixed in 422: `Narrate`'s `now` parameter was accepted and never
+used, so the "relative time" it appeared to provide did not exist. An
+unused parameter is a defect, not a style issue — it makes every caller
+believe in behaviour that was never implemented.
+
 ## Constraints
 
 - No new Go modules added

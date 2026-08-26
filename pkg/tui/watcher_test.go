@@ -543,7 +543,7 @@ func TestToSnapshots_UnloadedCacheSuppressesFalseChanges(t *testing.T) {
 	}
 	snap2 := toSnapshots(incidents, cache2)
 
-	changes := delta.Diff(snap1, snap2)
+	changes := delta.Diff(snap1, snap2, testNow)
 	for _, c := range changes {
 		assert.NotEqual(t, delta.NoteAdded, c.Kind,
 			"cache loading must not produce false NoteAdded")
@@ -568,7 +568,7 @@ func TestToSnapshots_GenuineNoteAdditionAfterCacheLoad(t *testing.T) {
 	}
 	snap2 := toSnapshots(incidents, cache2)
 
-	changes := delta.Diff(snap1, snap2)
+	changes := delta.Diff(snap1, snap2, testNow)
 	found := false
 	for _, c := range changes {
 		if c.Kind == delta.NoteAdded {

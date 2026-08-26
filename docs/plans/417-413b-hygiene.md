@@ -41,3 +41,26 @@ typed commands) are a recurring source of identity races. Snapshot the
 identity at the point of creation, not at the point of execution. The
 same principle applies to stream messages — every message must carry
 enough identity to be routed correctly even when superseded.
+
+### Follow-up: plan 422
+
+B1's fix was incomplete. `buildAskFromVerdict` was corrected for the
+`AskDraftNote` path, but the `AskEscalationSuggestion` path still
+snapshotted `*m.selectedIncident` — and worse, its `incidentID == ""`
+guard passed in exactly the case (nothing selected) that dispatched a
+zero-value `pagerduty.Incident`. Plan 422 (N2) resolves the incident by
+`ask.IncidentID` at accept time and adds a structural guard test that
+fails if any ask action reads `m.selectedIncident`.
+
+Two additions to the lesson, from 422:
+
+- **Fix the pattern, not the instance.** B1 fixed one branch of a
+  `switch` whose other branches had the same shape. When a defect is a
+  *pattern*, enumerate every site — or add a test that enforces the
+  pattern structurally rather than case by case.
+- **A guard that cannot fail is not a guard.** When a guard and the
+  value it protects come from different sources, the guard proves
+  nothing about the value.
+
+B5's message-identity fix also did not reach `typewriterTickMsg`, which
+remained a bare `struct{}`; plan 422 (N4) stamps it with a generation.

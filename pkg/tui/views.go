@@ -596,14 +596,18 @@ func (m model) renderClusterTab() (string, error) {
 	return content.String(), nil
 }
 
+// maxEnrichmentErrorRunes caps the inline enrichment error summary. Counted in
+// runes rather than bytes so multi-byte text is never cut mid-rune.
+const maxEnrichmentErrorRunes = 120
+
 func (m model) renderEnrichmentError(section string, errs map[string]error) string {
 	var msgs []string
 	for _, err := range errs {
 		msgs = append(msgs, err.Error())
 	}
 	summary := strings.Join(msgs, "; ")
-	if len(summary) > 120 {
-		summary = summary[:120] + "..."
+	if r := []rune(summary); len(r) > maxEnrichmentErrorRunes {
+		summary = string(r[:maxEnrichmentErrorRunes]) + "..."
 	}
 	text := fmt.Sprintf("\nFailed to load %s: %s — see logs for details\n", section, summary)
 	return m.styles.InlineError.Render(text)

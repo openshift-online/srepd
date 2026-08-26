@@ -63,11 +63,11 @@ func newMockStreamExecutor(output string) *mockStreamExecutor {
 	}
 }
 
-func (m *mockStreamExecutor) Start(_ context.Context, _ string, _ []string, _ []string) (io.WriteCloser, io.ReadCloser, *bytes.Buffer, func() error, error) {
+func (m *mockStreamExecutor) Start(_ context.Context, _ string, _ []string, _ []string) (io.WriteCloser, io.ReadCloser, *tailBuffer, func() error, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.started = true
-	return m.stdin, m.stdout, &bytes.Buffer{}, m.wait, nil
+	return m.stdin, m.stdout, newTailBuffer(defaultStderrTailBytes), m.wait, nil
 }
 
 func TestSession_SpawnOnFirstSend(t *testing.T) {
@@ -279,11 +279,11 @@ type argCapturingExecutor struct {
 	captured *[]string
 }
 
-func (e *argCapturingExecutor) Start(_ context.Context, _ string, args []string, _ []string) (io.WriteCloser, io.ReadCloser, *bytes.Buffer, func() error, error) {
+func (e *argCapturingExecutor) Start(_ context.Context, _ string, args []string, _ []string) (io.WriteCloser, io.ReadCloser, *tailBuffer, func() error, error) {
 	*e.captured = append([]string{}, args...)
 	stdin := &mockStdin{}
 	stdout := io.NopCloser(strings.NewReader(e.output))
-	return stdin, stdout, &bytes.Buffer{}, func() error { return nil }, nil
+	return stdin, stdout, newTailBuffer(defaultStderrTailBytes), func() error { return nil }, nil
 }
 
 func TestSession_Close(t *testing.T) {
@@ -373,7 +373,7 @@ type delegatingExecutor struct {
 	sessions map[string]*mockStreamExecutor
 }
 
-func (d *delegatingExecutor) Start(ctx context.Context, name string, args []string, env []string) (io.WriteCloser, io.ReadCloser, *bytes.Buffer, func() error, error) {
+func (d *delegatingExecutor) Start(ctx context.Context, name string, args []string, env []string) (io.WriteCloser, io.ReadCloser, *tailBuffer, func() error, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	m := d.create()
@@ -619,12 +619,12 @@ func TestSession_CloseNoSpuriousError(t *testing.T) {
 	pr, pw := io.Pipe()
 	waitErr := fmt.Errorf("signal: killed")
 	executor := &callbackExecutor{
-		startFn: func(ctx context.Context, _ string, _ []string, _ []string) (io.WriteCloser, io.ReadCloser, *bytes.Buffer, func() error, error) {
+		startFn: func(ctx context.Context, _ string, _ []string, _ []string) (io.WriteCloser, io.ReadCloser, *tailBuffer, func() error, error) {
 			go func() {
 				<-ctx.Done()
 				_ = pw.Close()
 			}()
-			return &mockStdin{}, pr, &bytes.Buffer{}, func() error {
+			return &mockStdin{}, pr, newTailBuffer(defaultStderrTailBytes), func() error {
 				<-ctx.Done()
 				return waitErr
 			}, nil
@@ -681,14 +681,14 @@ func TestSessionManager_CrashedSessionReplaced(t *testing.T) {
 	var spawnCount int
 	var lastArgs []string
 	exec := &callbackExecutor{
-		startFn: func(_ context.Context, _ string, args []string, _ []string) (io.WriteCloser, io.ReadCloser, *bytes.Buffer, func() error, error) {
+		startFn: func(_ context.Context, _ string, args []string, _ []string) (io.WriteCloser, io.ReadCloser, *tailBuffer, func() error, error) {
 			spawnCount++
 			lastArgs = append([]string{}, args...)
 			stdin := &mockStdin{}
 			output := `{"type":"system","subtype":"init","session_id":"test"}` + "\n" +
 				`{"type":"result","subtype":"success","session_id":"test","result":"ok","is_error":false}` + "\n"
 			stdout := io.NopCloser(strings.NewReader(output))
-			return stdin, stdout, &bytes.Buffer{}, func() error { return nil }, nil
+			return stdin, stdout, newTailBuffer(defaultStderrTailBytes), func() error { return nil }, nil
 		},
 	}
 
@@ -726,10 +726,10 @@ func TestSessionManager_CrashedSessionReplaced(t *testing.T) {
 
 // callbackExecutor delegates Start to a function for flexible test setups.
 type callbackExecutor struct {
-	startFn func(ctx context.Context, name string, args []string, env []string) (io.WriteCloser, io.ReadCloser, *bytes.Buffer, func() error, error)
+	startFn func(ctx context.Context, name string, args []string, env []string) (io.WriteCloser, io.ReadCloser, *tailBuffer, func() error, error)
 }
 
-func (e *callbackExecutor) Start(ctx context.Context, name string, args []string, env []string) (io.WriteCloser, io.ReadCloser, *bytes.Buffer, func() error, error) {
+func (e *callbackExecutor) Start(ctx context.Context, name string, args []string, env []string) (io.WriteCloser, io.ReadCloser, *tailBuffer, func() error, error) {
 	return e.startFn(ctx, name, args, env)
 }
 
@@ -771,14 +771,14 @@ func (w *hungWriter) Close() error {
 func TestSession_WriteGoroutineDoesNotLeak(t *testing.T) {
 	hw := newHungWriter()
 	executor := &callbackExecutor{
-		startFn: func(ctx context.Context, _ string, _ []string, _ []string) (io.WriteCloser, io.ReadCloser, *bytes.Buffer, func() error, error) {
+		startFn: func(ctx context.Context, _ string, _ []string, _ []string) (io.WriteCloser, io.ReadCloser, *tailBuffer, func() error, error) {
 			stdoutR, stdoutW := io.Pipe()
 			go func() {
 				_, _ = stdoutW.Write([]byte(`{"type":"system","subtype":"init","session_id":"test"}` + "\n"))
 				<-ctx.Done()
 				_ = stdoutW.Close()
 			}()
-			return hw, stdoutR, &bytes.Buffer{}, func() error {
+			return hw, stdoutR, newTailBuffer(defaultStderrTailBytes), func() error {
 				<-ctx.Done()
 				return fmt.Errorf("signal: killed")
 			}, nil
@@ -883,9 +883,9 @@ type customStdinExecutor struct {
 	output string
 }
 
-func (e *customStdinExecutor) Start(_ context.Context, _ string, _ []string, _ []string) (io.WriteCloser, io.ReadCloser, *bytes.Buffer, func() error, error) {
+func (e *customStdinExecutor) Start(_ context.Context, _ string, _ []string, _ []string) (io.WriteCloser, io.ReadCloser, *tailBuffer, func() error, error) {
 	stdout := io.NopCloser(strings.NewReader(e.output))
-	return e.stdin, stdout, &bytes.Buffer{}, func() error { return nil }, nil
+	return e.stdin, stdout, newTailBuffer(defaultStderrTailBytes), func() error { return nil }, nil
 }
 
 // contextAwareExecutor implements StreamCommandExecutor and RESPECTS
@@ -901,7 +901,7 @@ type contextAwareExecutor struct {
 	initOutput string
 }
 
-func (e *contextAwareExecutor) Start(ctx context.Context, _ string, _ []string, _ []string) (io.WriteCloser, io.ReadCloser, *bytes.Buffer, func() error, error) {
+func (e *contextAwareExecutor) Start(ctx context.Context, _ string, _ []string, _ []string) (io.WriteCloser, io.ReadCloser, *tailBuffer, func() error, error) {
 	stdin := &mockStdin{}
 	pr, pw := io.Pipe()
 
@@ -911,7 +911,7 @@ func (e *contextAwareExecutor) Start(ctx context.Context, _ string, _ []string, 
 		_ = pw.Close()
 	}()
 
-	return stdin, pr, &bytes.Buffer{}, func() error {
+	return stdin, pr, newTailBuffer(defaultStderrTailBytes), func() error {
 		<-ctx.Done()
 		return fmt.Errorf("signal: killed")
 	}, nil
@@ -967,13 +967,13 @@ func TestSession_SendDoesNotBlockClose(t *testing.T) {
 	pr, pw := io.Pipe()
 	hw := newHungWriter() // first write succeeds, subsequent writes block until Close
 	executor := &callbackExecutor{
-		startFn: func(ctx context.Context, _ string, _ []string, _ []string) (io.WriteCloser, io.ReadCloser, *bytes.Buffer, func() error, error) {
+		startFn: func(ctx context.Context, _ string, _ []string, _ []string) (io.WriteCloser, io.ReadCloser, *tailBuffer, func() error, error) {
 			go func() {
 				_, _ = pw.Write([]byte(`{"type":"system","subtype":"init","session_id":"test"}` + "\n"))
 				<-ctx.Done()
 				_ = pw.Close()
 			}()
-			return hw, pr, &bytes.Buffer{}, func() error {
+			return hw, pr, newTailBuffer(defaultStderrTailBytes), func() error {
 				<-ctx.Done()
 				return fmt.Errorf("signal: killed")
 			}, nil
@@ -1068,13 +1068,13 @@ func TestSpawn_HungChildReturnsWithinTimeout(t *testing.T) {
 	// A child that neither prints nor exits should not block forever.
 	// The spawn detection select must have a timeout/ctx.Done case.
 	executor := &callbackExecutor{
-		startFn: func(ctx context.Context, _ string, _ []string, _ []string) (io.WriteCloser, io.ReadCloser, *bytes.Buffer, func() error, error) {
+		startFn: func(ctx context.Context, _ string, _ []string, _ []string) (io.WriteCloser, io.ReadCloser, *tailBuffer, func() error, error) {
 			stdoutR, stdoutW := io.Pipe()
 			go func() {
 				<-ctx.Done()
 				_ = stdoutW.Close()
 			}()
-			return &mockStdin{}, stdoutR, &bytes.Buffer{}, func() error {
+			return &mockStdin{}, stdoutR, newTailBuffer(defaultStderrTailBytes), func() error {
 				<-ctx.Done()
 				return fmt.Errorf("signal: killed")
 			}, nil

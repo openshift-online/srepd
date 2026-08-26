@@ -573,7 +573,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.startAuthBannerTick()
 
 	case typewriterTickMsg:
-		return m, m.advanceTypewriter()
+		return m, m.advanceTypewriter(msg.gen)
 
 	case aiHealthCheckMsg:
 		m.aiHealth = msg.state

@@ -16,6 +16,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/log"
 	"github.com/openshift-online/srepd/pkg/agent"
+	"github.com/openshift-online/srepd/pkg/delta"
 	"github.com/openshift-online/srepd/pkg/launcher"
 	"github.com/openshift-online/srepd/pkg/pd"
 	"github.com/spf13/viper"
@@ -30,18 +31,20 @@ func createTestModel() model {
 	t := table.New()
 	t.SetStyles(styles.Table)
 	return model{
-		table:           t,
-		incidentCache:   make(map[string]*cachedIncidentData),
-		incidentList:    []pagerduty.Incident{},
-		theme:           theme,
-		styles:          styles,
-		cmdExecutor:     &execCommandExecutor{},
-		watcherBuffer:   newWatcherBuffer(50),
-		watcherViewport: newWatcherViewport(),
-		watcherMarker:   emojiWatcherMarker,
-		agentMarker:     emojiAgentMarker,
-		flagMarker:      emojiFlagMarker,
-		watcherDedup:    newWatcherDedup(5 * time.Minute),
+		table:            t,
+		incidentCache:    make(map[string]*cachedIncidentData),
+		incidentList:     []pagerduty.Incident{},
+		theme:            theme,
+		styles:           styles,
+		cmdExecutor:      &execCommandExecutor{},
+		watcherBuffer:    newWatcherBuffer(watcherBufferCapacity),
+		watcherViewport:  newWatcherViewport(),
+		watcherMarker:    emojiWatcherMarker,
+		agentMarker:      emojiAgentMarker,
+		flagMarker:       emojiFlagMarker,
+		watcherDedup:     newWatcherDedup(5 * time.Minute),
+		changeLog:        delta.NewLog(maxRecentChanges),
+		incidentRegistry: newIncidentRegistry(),
 	}
 }
 

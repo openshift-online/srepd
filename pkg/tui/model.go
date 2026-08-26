@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"charm.land/glamour/v2"
@@ -33,6 +34,100 @@ import (
 	"github.com/openshift-online/srepd/pkg/pd"
 	"github.com/spf13/viper"
 )
+
+// incidentRegistry is a mutex-guarded holder for the incident queue and the
+// current selection, owned by the model through a pointer.
+//
+// It exists for the same reason *delta.Log does (plan 422, fix N1). The Bubble
+// Tea Update method has a VALUE receiver, so every Update works on a fresh copy
+// of the model. A closure that captures a *model — as an ask Action closure
+// does when a pointer-receiver method is called from inside Update — captures a
+// pointer to Update's local stack copy. That copy dies when Update returns, so
+// the closure's later reads see a frozen snapshot: an incident list from the
+// moment the ask was created, not the live queue at the moment the user accepts
+// it.
+//
+// That is not only a stale read. updatedIncidentTitleMsg writes
+// m.incidentList[i].Title IN PLACE, and the dead copy's slice header aliases the
+// same backing array, so the closure's lookup races the Update loop's write.
+//
+// Holding a *incidentRegistry instead means the pointer survives the copies:
+// every model generation publishes into — and every ask Action reads from — one
+// shared, mutex-guarded holder. Lookups return an owned COPY of the incident, so
+// no caller can observe or alias the array the Update loop mutates.
+//
+// The zero value is not usable; construct with newIncidentRegistry. A nil
+// *incidentRegistry is safe: publishes are discarded and lookups miss.
+type incidentRegistry struct {
+	mu       sync.Mutex
+	list     []pagerduty.Incident
+	selected *pagerduty.Incident
+}
+
+func newIncidentRegistry() *incidentRegistry {
+	return &incidentRegistry{}
+}
+
+// Publish records the live incident queue and selection. Both are copied, so
+// the registry never aliases a slice the Update loop mutates in place, and a
+// later in-place write cannot be observed through a lookup.
+func (r *incidentRegistry) Publish(list []pagerduty.Incident, selected *pagerduty.Incident) {
+	if r == nil {
+		return
+	}
+
+	var listCopy []pagerduty.Incident
+	if len(list) > 0 {
+		listCopy = make([]pagerduty.Incident, len(list))
+		copy(listCopy, list)
+	}
+
+	var selectedCopy *pagerduty.Incident
+	if selected != nil {
+		s := *selected
+		selectedCopy = &s
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.list = listCopy
+	r.selected = selectedCopy
+}
+
+// Lookup resolves id against the live queue, falling back to the current
+// selection ONLY when the selection's own ID equals id — a lookup table keyed by
+// the caller's identity, never a substitute for it. It returns an owned copy, or
+// nil when id resolves to nothing. A caller must never treat a miss as licence
+// to dispatch a zero value.
+//
+// Freshness caveat: updatedIncidentTitleMsg writes Title in place without
+// publishing, so a looked-up Title can lag by one message until the follow-up
+// updatedIncidentListMsg republishes. Identity fields do not lag —
+// EscalationPolicy changes only via wholesale list replacement, which always
+// publishes — so the escalation path is unaffected. Do not start reading Title
+// from here without closing that gap.
+func (r *incidentRegistry) Lookup(id string) *pagerduty.Incident {
+	if r == nil || id == "" {
+		return nil
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for i := range r.list {
+		if r.list[i].ID == id {
+			found := r.list[i]
+			return &found
+		}
+	}
+
+	if r.selected != nil && r.selected.ID == id {
+		found := *r.selected
+		return &found
+	}
+
+	return nil
+}
 
 // cachedIncidentData stores fetched incident data for reuse
 type cachedIncidentData struct {
@@ -100,7 +195,13 @@ type model struct {
 
 	status string
 
-	incidentList           []pagerduty.Incident
+	incidentList []pagerduty.Incident
+	// incidentRegistry mirrors incidentList and selectedIncident into a
+	// mutex-guarded holder the model owns by POINTER, so it survives Update's
+	// value-receiver copies. Ask Action closures resolve their target through
+	// it at accept time instead of capturing a *model that dies with Update's
+	// stack frame. See the incidentRegistry doc comment for the full rationale.
+	incidentRegistry       *incidentRegistry
 	selectedIncident       *pagerduty.Incident
 	selectedIncidentNotes  []pagerduty.IncidentNote
 	selectedIncidentAlerts []pagerduty.IncidentAlert
@@ -167,18 +268,25 @@ type model struct {
 	aiHealth aiHealthState
 
 	// watcherExpanded is true when the AI watcher pane is visible below the table
-	watcherExpanded     bool
-	watcherViewport     viewport.Model
-	watcherBuffer       *watcherBuffer
-	watcherMarker       string
-	agentMarker         string
-	watcherDedup        *watcherDedup
-	prevSnapshots       []delta.Snapshot // previous poll's snapshots for diffing
-	recentChanges       []delta.Change   // bounded log of recent changes (max 200)
+	watcherExpanded bool
+	watcherViewport viewport.Model
+	watcherBuffer   *watcherBuffer
+	watcherMarker   string
+	agentMarker     string
+	watcherDedup    *watcherDedup
+	prevSnapshots   []delta.Snapshot // previous poll's snapshots for diffing
+	// changeLog is the single source of truth for recent incident-state
+	// changes. It is a pointer so it survives Update's value-receiver copies
+	// and so the get_recent_events tool handler — which runs on a tea.Cmd
+	// goroutine — reads the same mutex-guarded buffer the Update loop writes.
+	changeLog           *delta.Log
 	watcherAnalyzing    bool
 	watcherQueryStart   time.Time
 	watcherQueryTimeout time.Duration
 	typewriter          *typewriterState
+	// typewriterGen is a monotonic counter stamped into each typewriter run
+	// and its ticks, so a superseded run's ticks can be identified and dropped.
+	typewriterGen uint64
 
 	// Tool investigation state (Phase 3 AI rearchitecture)
 	toolRegistry       *tools.Registry
@@ -491,7 +599,7 @@ func InitialModel(
 		agentCLICommand:       agentCLICommand,
 		cmdExecutor:           &execCommandExecutor{},
 		watcherViewport:       newWatcherViewport(),
-		watcherBuffer:         newWatcherBuffer(50),
+		watcherBuffer:         newWatcherBuffer(watcherBufferCapacity),
 		docsViewer:            newDocsViewer(),
 		docsPages:             docs.EmbeddedDocs(),
 		docsTabsPerPage:       defaultDocsTabsPerPage,
@@ -502,6 +610,8 @@ func InitialModel(
 	m.watcherMarker = mk.watcher
 	m.agentMarker = mk.agent
 	m.watcherDedup = newWatcherDedup(5 * time.Minute)
+	m.changeLog = delta.NewLog(maxRecentChanges)
+	m.incidentRegistry = newIncidentRegistry()
 	m.approvals = newApprovalsStrip()
 	m.investigationCfg = resolveInvestigationConfig()
 	m.agentSystemPrompt = viper.GetString("agent_system_prompt")
@@ -633,7 +743,7 @@ func InitialModelWithConfig(
 		agentCLICommand:       agentCLICommand,
 		cmdExecutor:           &execCommandExecutor{},
 		watcherViewport:       newWatcherViewport(),
-		watcherBuffer:         newWatcherBuffer(50),
+		watcherBuffer:         newWatcherBuffer(watcherBufferCapacity),
 		docsViewer:            newDocsViewer(),
 		docsPages:             docs.EmbeddedDocs(),
 		docsTabsPerPage:       defaultDocsTabsPerPage,
@@ -644,6 +754,8 @@ func InitialModelWithConfig(
 	m.watcherMarker = mk2.watcher
 	m.agentMarker = mk2.agent
 	m.watcherDedup = newWatcherDedup(5 * time.Minute)
+	m.changeLog = delta.NewLog(maxRecentChanges)
+	m.incidentRegistry = newIncidentRegistry()
 	m.approvals = newApprovalsStrip()
 	m.investigationCfg = resolveInvestigationConfig()
 	m.agentSystemPrompt = viper.GetString("agent_system_prompt")
@@ -757,6 +869,13 @@ func (m *model) clearOCMCacheForIncident(incidentID string) {
 // cached (data + alerts + notes). Returns nil if no fetch is needed. The rate limiter
 // handles debouncing for rapid navigation.
 func (m *model) syncSelectedIncidentToHighlightedRow() tea.Cmd {
+	// Republish the live queue and selection into the registry that ask Action
+	// closures resolve through. This runs on the Update loop after every
+	// incident-list refresh and every navigation, so a closure created many
+	// polls ago still resolves against current state rather than the model copy
+	// that was alive when it was built. Deferred so every return path publishes.
+	defer func() { m.incidentRegistry.Publish(m.incidentList, m.selectedIncident) }()
+
 	row := m.table.SelectedRow()
 	if row == nil {
 		// Clear selection regardless of viewing state
@@ -964,6 +1083,24 @@ func defaultLogFilePath() string {
 	return logFilePathForOS(runtime.GOOS)
 }
 
+// buildAskFromVerdict constructs the approval ask for an actionable verdict.
+//
+// IMPORTANT: this has a pointer receiver but its only production call site is
+// inside `func (m model) Update` — a value receiver — so `m` here points at
+// Update's local stack copy, which dies as soon as Update returns. Nothing the
+// returned Action closures capture may therefore be `m` itself, or any
+// pointer-receiver method bound to it: dereferencing that dead copy later, on
+// the tea.Cmd goroutine that runs the accepted ask, yields a frozen snapshot of
+// state and races the Update loop's in-place writes to the shared incident
+// array.
+//
+// The closures instead capture only values that are safe to outlive the frame:
+// the ask's own IncidentID (the sole source of target identity), the body text,
+// m.config (assigned once at construction and never mutated afterwards), and
+// m.incidentRegistry — a pointer to a mutex-guarded holder that every model
+// generation republishes into, so accept-time resolution sees LIVE state. This
+// preserves the accept-time-resolution semantics of plan 422's fix N2 rather
+// than regressing to a creation-time snapshot of the target.
 func (m *model) buildAskFromVerdict(verdict tools.Verdict, originatingIncidentIDs []string) Ask {
 	kind := inferAskKind(verdict.Action)
 	ask := Ask{
@@ -975,17 +1112,36 @@ func (m *model) buildAskFromVerdict(verdict tools.Verdict, originatingIncidentID
 	// Use the investigation's originating incident rather than whichever
 	// incident happens to be selected in the UI. This fixes D2: an ambient
 	// watcher must not depend on UI selection state.
-	var originInc *pagerduty.Incident
-	if len(originatingIncidentIDs) > 0 {
-		originInc = findIncidentByID(m.incidentList, originatingIncidentIDs[0])
-	}
-	if originInc != nil {
-		ask.IncidentID = originInc.ID
-		ask.IncidentTitle = stripControl(originInc.Title)
-	} else if m.selectedIncident != nil {
+	//
+	// The origin ID wins even when the incident is no longer in the list — the
+	// ask's identity is the ID the investigation fired on, and the action
+	// resolves it again at accept time. Only a genuinely origin-less ask (the
+	// user-driven path, where no originating IDs were supplied) falls back to
+	// the current selection.
+	switch {
+	case len(originatingIncidentIDs) > 0 && originatingIncidentIDs[0] != "":
+		ask.IncidentID = stripControl(originatingIncidentIDs[0])
+		if originInc := findIncidentByID(m.incidentList, ask.IncidentID); originInc != nil {
+			ask.IncidentTitle = stripControl(originInc.Title)
+		}
+	case m.selectedIncident != nil:
 		ask.IncidentID = m.selectedIncident.ID
 		ask.IncidentTitle = stripControl(m.selectedIncident.Title)
 	}
+
+	// Values captured by the Action closures below. None of them is `m`, and
+	// none is a method value bound to `m` — see the function doc comment.
+	// config is safe to capture by value: it is assigned once during model
+	// construction and never reassigned, so no Update generation can change it.
+	config := m.config
+	registry := m.incidentRegistry
+
+	// Seed the registry from the state this Update generation can see, so an
+	// ask accepted before the next list refresh still resolves. Every later
+	// Update republishes over this, so it is a floor, not a snapshot of the
+	// target: the ask's identity remains ask.IncidentID and resolution stays at
+	// accept time.
+	registry.Publish(m.incidentList, m.selectedIncident)
 
 	switch kind {
 	case AskDraftNote:
@@ -995,26 +1151,27 @@ func (m *model) buildAskFromVerdict(verdict tools.Verdict, originatingIncidentID
 			if incidentID == "" {
 				return func() tea.Msg { return setStatusMsg{"no incident selected for note"} }
 			}
-			return m.postAINoteToIncidentCmd(incidentID, noteContent)
+			return postAINoteToIncidentCmd(config, incidentID, noteContent)
 		}
 	case AskSuggestedCommand:
 		cmdText := ask.Body
 		ask.Action = func() tea.Cmd {
-			return m.copyToClipboardCmd(cmdText)
+			return copyToClipboardCmd(cmdText)
 		}
 	case AskEscalationSuggestion:
+		// Resolve the incident by the ask's origin ID at accept time, against
+		// the LIVE registry. Reading the UI selection here would re-target
+		// whichever incident the user happened to be browsing, and would
+		// dispatch a zero-value Incident when nothing is selected at all — the
+		// incidentID guard cannot catch that, because the origin ID is
+		// non-empty in exactly that case. TestAskActionsDoNotReadSelectedIncident
+		// enforces this.
 		incidentID := ask.IncidentID
-		var snapshotIncident pagerduty.Incident
-		if m.selectedIncident != nil {
-			snapshotIncident = *m.selectedIncident
-		}
 		ask.Action = func() tea.Cmd {
 			if incidentID == "" {
 				return func() tea.Msg { return setStatusMsg{"no incident selected for re-escalation"} }
 			}
-			return func() tea.Msg {
-				return unAcknowledgeIncidentsMsg{incidents: []pagerduty.Incident{snapshotIncident}}
-			}
+			return reEscalateIncidentByIDCmd(registry, config, incidentID)
 		}
 	default:
 		noteContent := ask.Body
@@ -1023,28 +1180,76 @@ func (m *model) buildAskFromVerdict(verdict tools.Verdict, originatingIncidentID
 			if incidentID == "" {
 				return func() tea.Msg { return setStatusMsg{"no incident selected for note"} }
 			}
-			return m.postAINoteToIncidentCmd(incidentID, noteContent)
+			return postAINoteToIncidentCmd(config, incidentID, noteContent)
 		}
 	}
 
 	return ask
 }
 
-func (m *model) postAINoteToIncidentCmd(incidentID string, content string) tea.Cmd {
+// reEscalateIncidentByIDCmd resolves incidentID to a full incident and
+// dispatches it for re-escalation.
+//
+// It is a plain function, not a method, deliberately: it is called from an ask
+// Action closure that outlives the Update frame in which the ask was built, so
+// a pointer receiver would bind it to a dead model copy (see
+// buildAskFromVerdict's doc comment). It takes the mutex-guarded registry and
+// the immutable config explicitly instead.
+//
+// Resolution order, all keyed by incidentID and nothing else:
+//
+//  1. The live registry — which resolves against the current incident queue,
+//     and against the current selection ONLY when that selection's own ID
+//     equals incidentID. The selection is a lookup table keyed by the caller's
+//     identity, never a substitute for it, so this can never re-target the
+//     incident the user happens to be browsing.
+//  2. A PagerDuty fetch, for an origin that has aged out of the queue.
+//  3. A clean setStatusMsg.
+//
+// A zero-value pagerduty.Incident is unreachable on every path: dispatch only
+// ever happens with an incident that carried a matching non-empty ID, because
+// dispatching one would re-escalate nothing while reporting success.
+func reEscalateIncidentByIDCmd(registry *incidentRegistry, config *pd.Config, incidentID string) tea.Cmd {
 	return func() tea.Msg {
-		if m.config == nil || m.config.Client == nil {
+		if inc := registry.Lookup(incidentID); inc != nil {
+			return unAcknowledgeIncidentsMsg{incidents: []pagerduty.Incident{*inc}}
+		}
+
+		if config == nil || config.Client == nil {
+			return setStatusMsg{fmt.Sprintf("incident %s no longer in queue", incidentID)}
+		}
+
+		inc, err := pd.GetIncident(config.Client, incidentID)
+		if err != nil || inc == nil || inc.ID == "" {
+			log.Warn("ask.escalation", "msg", "origin incident unresolvable", "incident", incidentID, "error", err)
+			return setStatusMsg{fmt.Sprintf("incident %s no longer in queue", incidentID)}
+		}
+
+		return unAcknowledgeIncidentsMsg{incidents: []pagerduty.Incident{*inc}}
+	}
+}
+
+// postAINoteToIncidentCmd posts an AI-drafted note to incidentID. Like
+// reEscalateIncidentByIDCmd it is a plain function so an ask Action closure
+// cannot bind it to a dead model copy; config is passed explicitly.
+func postAINoteToIncidentCmd(config *pd.Config, incidentID string, content string) tea.Cmd {
+	return func() tea.Msg {
+		if config == nil || config.Client == nil {
 			return errMsg{fmt.Errorf("PagerDuty not configured")}
 		}
-		u, err := pd.GetCurrentUser(m.config.Client)
+		u, err := pd.GetCurrentUser(config.Client)
 		if err != nil {
 			return errMsg{err}
 		}
-		n, err := pd.PostNote(m.config.Client, incidentID, u, content)
+		n, err := pd.PostNote(config.Client, incidentID, u, content)
 		return addedIncidentNoteMsg{n, err, incidentID}
 	}
 }
 
-func (m *model) copyToClipboardCmd(text string) tea.Cmd {
+// copyToClipboardCmd reports a suggested command to the user. It reads no model
+// state at all, so it is a plain function for consistency with the other ask
+// commands rather than out of necessity.
+func copyToClipboardCmd(text string) tea.Cmd {
 	return func() tea.Msg {
 		return setStatusMsg{fmt.Sprintf("Suggested command: %s (copy to terminal)", text)}
 	}
@@ -1079,8 +1284,9 @@ func initToolRegistryForModel(m *model) {
 			log.Warn("ai.tools", "msg", "failed to register OCM tools", "error", err)
 		}
 	}
+	changeLog := m.changeLog
 	if err := tools.RegisterDeltaTools(reg, func() []delta.Change {
-		return m.recentChanges
+		return changeLog.Recent(0)
 	}); err != nil {
 		log.Warn("ai.tools", "msg", "failed to register delta tools", "error", err)
 	}

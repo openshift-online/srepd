@@ -203,6 +203,9 @@ func TestBuildAskFromVerdict_Escalation_TargetsOriginalIncident(t *testing.T) {
 		Title:     "Incident B",
 	}
 
+	// Both incidents are in the queue, as they would be in the real UI: the
+	// escalation action resolves the ask's ID against this list.
+	m.incidentList = []pagerduty.Incident{incidentA, incidentB}
 	m.selectedIncident = &incidentA
 
 	verdict := tools.Verdict{

@@ -45,6 +45,10 @@ func resolveMarkers(useEmoji bool) markers {
 	}
 }
 
+// watcherBufferCapacity bounds the watcher pane's scrollback in entries. The
+// pane is a live feed, not a log: older entries are dropped rather than grown.
+const watcherBufferCapacity = 50
+
 type watcherBuffer struct {
 	entries  []string
 	capacity int
@@ -159,9 +163,19 @@ type typewriterState struct {
 	index   int
 	marker  string
 	partial string
+	// gen identifies this typewriter run. Ticks carry the same value so a
+	// superseded run's in-flight ticks can be dropped instead of advancing
+	// its successor (which showed up as double-speed output when a `:watcher`
+	// response landed during an investigation verdict).
+	gen uint64
 }
 
-type typewriterTickMsg struct{}
+// typewriterTickMsg advances the typewriter identified by gen. A tick whose
+// gen does not match the live typewriter is stale and must be discarded — see
+// plan 417's lesson that every async message carries routing identity.
+type typewriterTickMsg struct {
+	gen uint64
+}
 
 func splitKeepingNewlines(text string) []string {
 	var tokens []string
@@ -181,18 +195,24 @@ func (m *model) startTypewriter(marker string, text string) tea.Cmd {
 	if len(words) == 0 {
 		return nil
 	}
+	m.typewriterGen++
+	gen := m.typewriterGen
 	m.typewriter = &typewriterState{
 		words:  words,
 		marker: marker,
+		gen:    gen,
 	}
 	return tea.Tick(typewriterTickInterval, func(time.Time) tea.Msg {
-		return typewriterTickMsg{}
+		return typewriterTickMsg{gen: gen}
 	})
 }
 
-func (m *model) advanceTypewriter() tea.Cmd {
+// advanceTypewriter advances the run identified by gen. Ticks from a
+// superseded run are dropped: they must neither advance the live typewriter
+// nor reschedule themselves.
+func (m *model) advanceTypewriter(gen uint64) tea.Cmd {
 	tw := m.typewriter
-	if tw == nil {
+	if tw == nil || tw.gen != gen {
 		return nil
 	}
 
@@ -222,7 +242,7 @@ func (m *model) advanceTypewriter() tea.Cmd {
 	}
 
 	return tea.Tick(typewriterTickInterval, func(time.Time) tea.Msg {
-		return typewriterTickMsg{}
+		return typewriterTickMsg{gen: gen}
 	})
 }
 
@@ -362,15 +382,10 @@ func toSnapshots(incidents []pagerduty.Incident, cache map[string]*cachedInciden
 
 func (m *model) computeAndStoreDeltas() []delta.Change {
 	curr := toSnapshots(m.incidentList, m.incidentCache)
-	changes := delta.Diff(m.prevSnapshots, curr)
+	changes := delta.Diff(m.prevSnapshots, curr, time.Now())
 	m.prevSnapshots = curr
 
-	if len(changes) > 0 {
-		m.recentChanges = append(m.recentChanges, changes...)
-		if len(m.recentChanges) > maxRecentChanges {
-			m.recentChanges = m.recentChanges[len(m.recentChanges)-maxRecentChanges:]
-		}
-	}
+	m.changeLog.Append(changes...)
 
 	return changes
 }

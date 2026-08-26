@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
@@ -16,9 +17,10 @@ const (
 )
 
 type anthropicProvider struct {
-	client anthropic.Client
-	model  string
-	name   string
+	client         anthropic.Client
+	model          string
+	name           string
+	requestTimeout time.Duration
 }
 
 func newAnthropicProvider(cfg Config, apiKey string) (*anthropicProvider, error) {
@@ -40,9 +42,10 @@ func newAnthropicProvider(cfg Config, apiKey string) (*anthropicProvider, error)
 	}
 
 	return &anthropicProvider{
-		client: client,
-		model:  model,
-		name:   "anthropic",
+		client:         client,
+		model:          model,
+		name:           "anthropic",
+		requestTimeout: defaultRequestTimeout,
 	}, nil
 }
 
@@ -59,6 +62,8 @@ func (p *anthropicProvider) SupportsStreaming() bool { return true }
 
 func (p *anthropicProvider) Query(ctx context.Context, systemPrompt string, userPrompt string) (string, error) {
 	log.Debug("anthropic.Query", "model", p.model)
+	ctx, cancel := ensureTimeout(ctx, p.requestTimeout)
+	defer cancel()
 	params := anthropic.MessageNewParams{
 		Model:     p.model,
 		MaxTokens: anthropicDefaultMaxTokens,
@@ -123,7 +128,13 @@ func (p *anthropicProvider) StreamQuery(ctx context.Context, systemPrompt string
 		case anthropic.ContentBlockDeltaEvent:
 			switch deltaVariant := eventVariant.Delta.AsAny().(type) {
 			case anthropic.TextDelta:
-				ch <- deltaVariant.Text
+				// Abandon the send if the consumer is gone; an unguarded
+				// send on an unread channel leaks this goroutine.
+				select {
+				case ch <- deltaVariant.Text:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
 			}
 		}
 	}

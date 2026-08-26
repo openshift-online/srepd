@@ -2,7 +2,6 @@ package agent
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -16,6 +15,20 @@ import (
 	"github.com/charmbracelet/log"
 	"github.com/google/uuid"
 )
+
+// sessionInUseMarker is the substring the Claude CLI emits on stderr when a
+// session id is already held by another process; spawn treats it as the signal
+// to retry as --resume. Re-verify this string whenever the tested claude
+// version bumps — it is not a stable API.
+const sessionInUseMarker = "already in use"
+
+// eventChanBuffer sizes the channel the TUI drains parsed events from. It
+// absorbs a burst of events between Update ticks without blocking readLoop.
+const eventChanBuffer = 128
+
+// stdoutScannerBuffer sizes bufio.Scanner's buffer for the child's NDJSON
+// stream. Tool results and large assistant turns exceed the 64KiB default.
+const stdoutScannerBuffer = 256 * 1024
 
 // deniedFlags are CLI flags that a user must not inject via
 // agent_cli_command because srepd owns them (they control the
@@ -89,20 +102,21 @@ func ValidateUserFlags(tokens []string) error {
 
 // StreamCommandExecutor abstracts spawning a long-lived process with
 // stdin/stdout pipes. The real implementation uses os/exec; tests inject
-// a mock. stderr is captured into a buffer for error detection (e.g.
-// "Session ID already in use" recovery).
+// a mock. stderr is captured into a bounded tail buffer for error detection
+// (e.g. "Session ID already in use" recovery); only the tail is needed, and
+// bounding it stops a chatty child from growing the buffer without limit.
 type StreamCommandExecutor interface {
-	Start(ctx context.Context, name string, args []string, env []string) (stdin io.WriteCloser, stdout io.ReadCloser, stderr *bytes.Buffer, wait func() error, err error)
+	Start(ctx context.Context, name string, args []string, env []string) (stdin io.WriteCloser, stdout io.ReadCloser, stderr *tailBuffer, wait func() error, err error)
 }
 
 // execStreamExecutor is the default implementation using os/exec.
 type execStreamExecutor struct{}
 
-func (e *execStreamExecutor) Start(ctx context.Context, name string, args []string, env []string) (io.WriteCloser, io.ReadCloser, *bytes.Buffer, func() error, error) {
+func (e *execStreamExecutor) Start(ctx context.Context, name string, args []string, env []string) (io.WriteCloser, io.ReadCloser, *tailBuffer, func() error, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Env = env
-	var stderrBuf bytes.Buffer
-	cmd.Stderr = io.MultiWriter(os.Stderr, &stderrBuf)
+	stderrBuf := newTailBuffer(defaultStderrTailBytes)
+	cmd.Stderr = io.MultiWriter(os.Stderr, stderrBuf)
 	cmd.WaitDelay = 2 * time.Second
 
 	stdin, err := cmd.StdinPipe()
@@ -119,7 +133,7 @@ func (e *execStreamExecutor) Start(ctx context.Context, name string, args []stri
 		_ = stdout.Close()
 		return nil, nil, nil, nil, fmt.Errorf("start: %w", err)
 	}
-	return stdin, stdout, &stderrBuf, cmd.Wait, nil
+	return stdin, stdout, stderrBuf, cmd.Wait, nil
 }
 
 // prefixedReadCloser prepends a consumed peek byte to the underlying
@@ -191,7 +205,7 @@ func NewSession(cfg Config, incidentID string, executor StreamCommandExecutor, e
 		exec:         executor,
 		env:          env,
 		lifecycleCtx: context.Background(),
-		events:       make(chan Event, 128),
+		events:       make(chan Event, eventChanBuffer),
 		done:         make(chan struct{}),
 	}
 }
@@ -206,11 +220,28 @@ func (s *Session) Done() <-chan struct{} {
 	return s.done
 }
 
-// SetTestChannels replaces the event and done channels for testing.
-// Only for use in tests — the session must not be spawned.
-func SetTestChannels(s *Session, events chan Event, done chan struct{}) {
-	s.events = events
-	s.done = done
+// NewSessionWithChannels returns a fully-initialized, unspawned Session that
+// reads from the supplied channels. It exists so callers outside this package
+// can drive Events()/Done() directly — the consumer lives in pkg/tui, so an
+// export_test.go helper cannot reach it, and a build-tag variant would mean
+// threading a tag through every Makefile target and the lint config.
+//
+// A constructor rather than a mutator on purpose: swapping the channels of a
+// session whose readLoop is already running is an unsynchronized write to a
+// live session, and there is no legitimate reason to do it. Nil channels are
+// replaced with real ones so the returned Session is never half-built.
+func NewSessionWithChannels(events chan Event, done chan struct{}) *Session {
+	if events == nil {
+		events = make(chan Event, eventChanBuffer)
+	}
+	if done == nil {
+		done = make(chan struct{})
+	}
+	return &Session{
+		lifecycleCtx: context.Background(),
+		events:       events,
+		done:         done,
+	}
 }
 
 // Send writes a user turn to the session's stdin. On the first call it
@@ -337,7 +368,7 @@ func (s *Session) spawn(ctx context.Context) error {
 				_ = stdout.Close()
 				<-peekResult
 				if stderrBuf != nil &&
-					strings.Contains(stderrBuf.String(), "already in use") {
+					strings.Contains(stderrBuf.String(), sessionInUseMarker) {
 					return retryAsResume()
 				}
 			} else {
@@ -350,7 +381,7 @@ func (s *Session) spawn(ctx context.Context) error {
 			if peekErr != nil {
 				exitErr := <-exitCh
 				if exitErr != nil && stderrBuf != nil &&
-					strings.Contains(stderrBuf.String(), "already in use") {
+					strings.Contains(stderrBuf.String(), sessionInUseMarker) {
 					return retryAsResume()
 				}
 				exitCh <- exitErr
@@ -423,7 +454,7 @@ func (s *Session) readLoop(stdout io.ReadCloser, wait func() error) {
 	}()
 
 	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 256*1024), 256*1024)
+	scanner.Buffer(make([]byte, stdoutScannerBuffer), stdoutScannerBuffer)
 
 	for scanner.Scan() {
 		events, err := ParseStreamEvent(scanner.Bytes())
@@ -490,20 +521,28 @@ func (s *Session) Close() error {
 	return nil
 }
 
+// maxEvictedEntries bounds the evicted set. Entries are normally removed when
+// consumed (a resumed incident no longer needs the flag), so this is a
+// backstop for a long-lived process that keeps evicting incidents it never
+// revisits. Dropping the oldest flags only costs a redundant --resume attempt
+// on an incident the session index usually still knows about.
+const maxEvictedEntries = 256
+
 // SessionManager manages per-incident sessions with LRU eviction.
 // When a session is evicted, a new Session value is created on next
 // access with resumed=true, avoiding races with the old readLoop.
 type SessionManager struct {
-	mu        sync.Mutex
-	sessions  map[string]*Session
-	evicted   map[string]bool // incidents that were evicted and need --resume
-	order     []string        // LRU order: oldest first
-	maxLive   int
-	cfg       Config
-	exec      StreamCommandExecutor
-	index     *sessionIndex
-	ctx       context.Context    // cancelled by CloseAll; parent for all session spawnCtx
-	ctxCancel context.CancelFunc // cancels ctx
+	mu           sync.Mutex
+	sessions     map[string]*Session
+	evicted      map[string]bool // incidents that were evicted and need --resume
+	evictedOrder []string        // insertion order into evicted, oldest first
+	order        []string        // LRU order: oldest first
+	maxLive      int
+	cfg          Config
+	exec         StreamCommandExecutor
+	index        *sessionIndex
+	ctx          context.Context    // cancelled by CloseAll; parent for all session spawnCtx
+	ctxCancel    context.CancelFunc // cancels ctx
 }
 
 // NewSessionManager creates a SessionManager with the given config.
@@ -555,7 +594,7 @@ func (m *SessionManager) GetOrCreate(incidentID string, env []string) *Session {
 				break
 			}
 		}
-		m.evicted[incidentID] = true
+		m.markEvicted(incidentID)
 	}
 
 	// Evict oldest if at capacity
@@ -565,7 +604,7 @@ func (m *SessionManager) GetOrCreate(incidentID string, env []string) *Session {
 		if s, ok := m.sessions[oldest]; ok {
 			_ = s.Close()
 			delete(m.sessions, oldest)
-			m.evicted[oldest] = true
+			m.markEvicted(oldest)
 		}
 	}
 
@@ -574,6 +613,9 @@ func (m *SessionManager) GetOrCreate(incidentID string, env []string) *Session {
 	if m.evicted[incidentID] || m.index.has(incidentID) {
 		s.resumed = true
 	}
+	// The flag has served its purpose now that the successor session carries
+	// resumed=true; keeping it would grow the map for the process's lifetime.
+	m.clearEvicted(incidentID)
 
 	idx := m.index
 	sid := s.id
@@ -584,6 +626,38 @@ func (m *SessionManager) GetOrCreate(incidentID string, env []string) *Session {
 	m.sessions[incidentID] = s
 	m.order = append(m.order, incidentID)
 	return s
+}
+
+// markEvicted records that incidentID needs --resume on its next access,
+// evicting the oldest flags once the set exceeds maxEvictedEntries. Callers
+// must hold m.mu.
+func (m *SessionManager) markEvicted(incidentID string) {
+	if m.evicted[incidentID] {
+		return
+	}
+	m.evicted[incidentID] = true
+	m.evictedOrder = append(m.evictedOrder, incidentID)
+
+	for len(m.evictedOrder) > maxEvictedEntries {
+		oldest := m.evictedOrder[0]
+		m.evictedOrder = m.evictedOrder[1:]
+		delete(m.evicted, oldest)
+	}
+}
+
+// clearEvicted drops incidentID's flag once it has been consumed. Callers must
+// hold m.mu.
+func (m *SessionManager) clearEvicted(incidentID string) {
+	if !m.evicted[incidentID] {
+		return
+	}
+	delete(m.evicted, incidentID)
+	for i, id := range m.evictedOrder {
+		if id == incidentID {
+			m.evictedOrder = append(m.evictedOrder[:i], m.evictedOrder[i+1:]...)
+			break
+		}
+	}
 }
 
 func (m *SessionManager) touch(incidentID string) {

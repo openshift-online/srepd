@@ -238,6 +238,13 @@ func BuildSpawnArgs(cfg Config, sessionID uuid.UUID, resume bool) []string {
 	return args
 }
 
+// Summary length caps, in runes rather than bytes so multi-byte text is never
+// cut mid-rune.
+const (
+	maxCommandSummaryRunes = 80
+	maxRawSummaryRunes     = 100
+)
+
 // summarizeToolInput returns a compact one-line summary of tool input JSON.
 func summarizeToolInput(input json.RawMessage) string {
 	var m map[string]interface{}
@@ -248,8 +255,9 @@ func summarizeToolInput(input json.RawMessage) string {
 		return desc
 	}
 	if cmd, ok := m["command"].(string); ok && cmd != "" {
-		if len(cmd) > 80 {
-			return cmd[:80] + "..."
+		// Rune-aware: byte-slicing splits multi-byte runes and emits U+FFFD.
+		if r := []rune(cmd); len(r) > maxCommandSummaryRunes {
+			return string(r[:maxCommandSummaryRunes]) + "..."
 		}
 		return cmd
 	}
@@ -257,9 +265,8 @@ func summarizeToolInput(input json.RawMessage) string {
 		return fp
 	}
 	s := string(input)
-	if len(s) > 100 {
-		truncated := string([]rune(s)[:100])
-		return truncated + "..."
+	if r := []rune(s); len(r) > maxRawSummaryRunes {
+		return string(r[:maxRawSummaryRunes]) + "..."
 	}
 	return s
 }
