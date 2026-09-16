@@ -318,21 +318,25 @@ func (c *Client) GetServiceLogs(ctx context.Context, clusterID, externalID strin
 
 	var logs []ServiceLog
 	response.Items().Each(func(entry *slv1.LogEntry) bool {
-		logs = append(logs, ServiceLog{
-			Timestamp:    entry.Timestamp().String(),
-			Severity:     string(entry.Severity()),
-			ServiceName:  entry.ServiceName(),
-			Summary:      entry.Summary(),
-			Description:  entry.Description(),
-			ClusterID:    entry.ClusterID(),
-			ClusterUUID:  entry.ClusterUUID(),
-			InternalOnly: entry.InternalOnly(),
-		})
+		logs = append(logs, serviceLogFromResponse(entry))
 		return true
 	})
 
 	log.Debug("ocm.GetServiceLogs", "cluster_id", clusterID, "count", len(logs))
 	return logs, nil
+}
+
+func serviceLogFromResponse(entry *slv1.LogEntry) ServiceLog {
+	return ServiceLog{
+		Timestamp:    entry.Timestamp().String(),
+		Severity:     string(entry.Severity()),
+		ServiceName:  entry.ServiceName(),
+		Summary:      entry.Summary(),
+		Description:  entry.Description(),
+		ClusterID:    entry.ClusterID(),
+		ClusterUUID:  entry.ClusterUUID(),
+		InternalOnly: entry.InternalOnly(),
+	}
 }
 
 func (c *Client) GetLimitedSupportHistory(ctx context.Context, clusterID string) ([]LimitedSupportReason, error) {
@@ -348,18 +352,22 @@ func (c *Client) GetLimitedSupportHistory(ctx context.Context, clusterID string)
 
 	var reasons []LimitedSupportReason
 	response.Items().Each(func(reason *cmv1.LimitedSupportReason) bool {
-		reasons = append(reasons, LimitedSupportReason{
-			ID:            reason.ID(),
-			Summary:       reason.Summary(),
-			Details:       reason.Details(),
-			DetectionType: string(reason.DetectionType()),
-			CreatedAt:     reason.CreationTimestamp().String(),
-		})
+		reasons = append(reasons, limitedSupportReasonFromResponse(reason))
 		return true
 	})
 
 	log.Debug("ocm.GetLimitedSupportHistory", "cluster_id", clusterID, "count", len(reasons))
 	return reasons, nil
+}
+
+func limitedSupportReasonFromResponse(reason *cmv1.LimitedSupportReason) LimitedSupportReason {
+	return LimitedSupportReason{
+		ID:            reason.ID(),
+		Summary:       reason.Summary(),
+		Details:       reason.Details(),
+		DetectionType: string(reason.DetectionType()),
+		CreatedAt:     reason.CreationTimestamp().String(),
+	}
 }
 
 func (c *Client) GetBackplaneURL() (string, error) {

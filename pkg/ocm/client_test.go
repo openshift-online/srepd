@@ -5,12 +5,14 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	ocmconfig "github.com/openshift-online/ocm-common/pkg/ocm/config"
 	cmv1 "github.com/openshift-online/ocm-sdk-go/clustersmgmt/v1"
+	slv1 "github.com/openshift-online/ocm-sdk-go/servicelogs/v1"
 )
 
 func TestCheckTokens_NoConfigFile(t *testing.T) {
@@ -226,5 +228,102 @@ func TestClusterFromResponse(t *testing.T) {
 		info := clusterFromResponse(cluster)
 
 		assert.Equal(t, "aws", info.CloudProvider)
+	})
+}
+
+func TestServiceLogFromResponse(t *testing.T) {
+	t.Run("every field mapped", func(t *testing.T) {
+		ts := time.Date(2026, 9, 16, 12, 30, 0, 0, time.UTC)
+		entry, err := slv1.NewLogEntry().
+			Timestamp(ts).
+			Severity(slv1.SeverityWarning).
+			ServiceName("SREManualAction").
+			Summary("cluster flagged for review").
+			Description("investigate elevated error rate").
+			ClusterID("internal-id-123").
+			ClusterUUID("ext-uuid-456").
+			InternalOnly(true).
+			Build()
+		require.NoError(t, err)
+
+		mapped := serviceLogFromResponse(entry)
+
+		assert.Equal(t, ts.String(), mapped.Timestamp)
+		assert.Equal(t, "Warning", mapped.Severity)
+		assert.Equal(t, "SREManualAction", mapped.ServiceName)
+		assert.Equal(t, "cluster flagged for review", mapped.Summary)
+		assert.Equal(t, "investigate elevated error rate", mapped.Description)
+		assert.Equal(t, "internal-id-123", mapped.ClusterID)
+		assert.Equal(t, "ext-uuid-456", mapped.ClusterUUID)
+		assert.True(t, mapped.InternalOnly)
+	})
+
+	t.Run("zero-value builder", func(t *testing.T) {
+		entry, err := slv1.NewLogEntry().Build()
+		require.NoError(t, err)
+
+		mapped := serviceLogFromResponse(entry)
+
+		assert.Equal(t, time.Time{}.String(), mapped.Timestamp)
+		assert.Empty(t, mapped.Severity)
+		assert.Empty(t, mapped.ServiceName)
+		assert.Empty(t, mapped.Summary)
+		assert.Empty(t, mapped.Description)
+		assert.Empty(t, mapped.ClusterID)
+		assert.Empty(t, mapped.ClusterUUID)
+		assert.False(t, mapped.InternalOnly)
+	})
+
+	t.Run("nil entry is safe", func(t *testing.T) {
+		var entry *slv1.LogEntry
+
+		assert.NotPanics(t, func() {
+			mapped := serviceLogFromResponse(entry)
+			assert.Empty(t, mapped.ServiceName)
+		})
+	})
+}
+
+func TestLimitedSupportReasonFromResponse(t *testing.T) {
+	t.Run("every field mapped", func(t *testing.T) {
+		createdAt := time.Date(2026, 9, 1, 8, 0, 0, 0, time.UTC)
+		reason, err := cmv1.NewLimitedSupportReason().
+			ID("reason-id-1").
+			Summary("Cluster has degraded storage").
+			Details("Storage node unreachable for more than 24h").
+			DetectionType(cmv1.DetectionTypeAuto).
+			CreationTimestamp(createdAt).
+			Build()
+		require.NoError(t, err)
+
+		info := limitedSupportReasonFromResponse(reason)
+
+		assert.Equal(t, "reason-id-1", info.ID)
+		assert.Equal(t, "Cluster has degraded storage", info.Summary)
+		assert.Equal(t, "Storage node unreachable for more than 24h", info.Details)
+		assert.Equal(t, "auto", info.DetectionType)
+		assert.Equal(t, createdAt.String(), info.CreatedAt)
+	})
+
+	t.Run("zero-value builder", func(t *testing.T) {
+		reason, err := cmv1.NewLimitedSupportReason().Build()
+		require.NoError(t, err)
+
+		info := limitedSupportReasonFromResponse(reason)
+
+		assert.Empty(t, info.ID)
+		assert.Empty(t, info.Summary)
+		assert.Empty(t, info.Details)
+		assert.Empty(t, info.DetectionType)
+		assert.Equal(t, time.Time{}.String(), info.CreatedAt)
+	})
+
+	t.Run("nil reason is safe", func(t *testing.T) {
+		var reason *cmv1.LimitedSupportReason
+
+		assert.NotPanics(t, func() {
+			info := limitedSupportReasonFromResponse(reason)
+			assert.Empty(t, info.ID)
+		})
 	})
 }
