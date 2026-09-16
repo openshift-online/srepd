@@ -14,6 +14,7 @@ import (
 	"github.com/muesli/termenv"
 
 	"github.com/openshift-online/srepd/pkg/ai"
+	"github.com/openshift-online/srepd/pkg/alert"
 	"github.com/openshift-online/srepd/pkg/delta"
 )
 
@@ -516,13 +517,13 @@ func buildObservationContext(m *model, obs watcherObservation) string {
 			alerts = cached.alerts
 		}
 
-		for _, alert := range alerts {
-			if details, ok := alert.Body["details"].(map[string]interface{}); ok {
+		for _, a := range alerts {
+			if details, ok := a.Body["details"].(map[string]interface{}); ok {
 				if name, ok := details["alert_name"].(string); ok {
 					parts = append(parts, fmt.Sprintf("Alert: %s", name))
 				}
-				if sopURL, ok := details["firing"].(string); ok && sopURL != "" {
-					parts = append(parts, fmt.Sprintf("SOP: %s", sopURL))
+				if sop := alert.NormalizeAlert(inc.Service.Summary, inc.Title, a).SOPLink; sop != "" {
+					parts = append(parts, fmt.Sprintf("SOP: %s", sop))
 				}
 				if cluster, ok := details["cluster_id"].(string); ok {
 					parts = append(parts, fmt.Sprintf("Cluster: %s", cluster))
@@ -585,13 +586,13 @@ func buildWatcherContext(m *model) string {
 			alerts = m.selectedIncidentAlerts
 		}
 
-		for _, alert := range alerts {
-			if details, ok := alert.Body["details"].(map[string]interface{}); ok {
+		for _, a := range alerts {
+			if details, ok := a.Body["details"].(map[string]interface{}); ok {
 				if name, ok := details["alert_name"].(string); ok {
 					parts = append(parts, fmt.Sprintf("Alert: %s", name))
 				}
-				if sopURL, ok := details["firing"].(string); ok && sopURL != "" {
-					parts = append(parts, fmt.Sprintf("SOP: %s", sopURL))
+				if sop := alert.NormalizeAlert(inc.Service.Summary, inc.Title, a).SOPLink; sop != "" {
+					parts = append(parts, fmt.Sprintf("SOP: %s", sop))
 				}
 				if cluster, ok := details["cluster_id"].(string); ok {
 					parts = append(parts, fmt.Sprintf("Cluster: %s", cluster))

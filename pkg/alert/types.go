@@ -35,6 +35,30 @@ func getDetail(field string, alert pagerduty.IncidentAlert) string {
 	return fieldStr
 }
 
+// getFiringDetail reads the "firing" detail off the alert body and flattens
+// it into a map, regardless of the shape PagerDuty delivered it in. go-pagerduty
+// decodes IncidentAlert.Body as map[string]interface{}, so a "firing" detail
+// that is itself a JSON array/object (some app-interface PrometheusRules send
+// the raw Alertmanager webhook payload verbatim) arrives pre-decoded as
+// []interface{} / map[string]interface{} — getDetail's string-only assertion
+// would silently return "" for that shape. Comma-ok all the way down; returns
+// an empty (non-nil) map when "firing" is missing or any container along the
+// way isn't the expected type.
+func getFiringDetail(alert pagerduty.IncidentAlert) map[string]string {
+	if alert.Body == nil {
+		return make(map[string]string)
+	}
+	detailsRaw, ok := alert.Body["details"]
+	if !ok || detailsRaw == nil {
+		return make(map[string]string)
+	}
+	details, ok := detailsRaw.(map[string]interface{})
+	if !ok {
+		return make(map[string]string)
+	}
+	return parseFiringValue(details["firing"])
+}
+
 // parseFiringCount extracts the num_firing field as an integer.
 func parseFiringCount(alert pagerduty.IncidentAlert) int {
 	s := getDetail("num_firing", alert)
@@ -92,17 +116,14 @@ func parseOSDHive(n *NormalizedAlert, title string, alert pagerduty.IncidentAler
 	}
 
 	// Extract namespace and description from firing field if available
-	firingText := getDetail("firing", alert)
-	if firingText != "" {
-		firingFields := ParseFiring(firingText)
-		if ns, ok := firingFields["namespace"]; ok {
-			n.Namespace = ns
-		}
-		if desc, ok := firingFields["description"]; ok {
-			n.Description = desc
-		} else if msg, ok := firingFields["message"]; ok {
-			n.Description = msg
-		}
+	firingFields := getFiringDetail(alert)
+	if ns, ok := firingFields["namespace"]; ok {
+		n.Namespace = ns
+	}
+	if desc, ok := firingFields["description"]; ok {
+		n.Description = desc
+	} else if msg, ok := firingFields["message"]; ok {
+		n.Description = msg
 	}
 }
 
@@ -126,59 +147,56 @@ func parseAppSRE(n *NormalizedAlert, title string, alert pagerduty.IncidentAlert
 		n.AlertName = matches[2]
 	}
 
-	// Parse the firing text for structured data
-	firingText := getDetail("firing", alert)
-	if firingText != "" {
-		firingFields := ParseFiring(firingText)
+	// Parse the firing detail for structured data, whatever shape it arrived in
+	firingFields := getFiringDetail(alert)
 
-		// Severity from firing labels
-		if sev, ok := firingFields["severity"]; ok {
-			n.Severity = strings.ToLower(sev)
-		}
+	// Severity from firing labels
+	if sev, ok := firingFields["severity"]; ok {
+		n.Severity = strings.ToLower(sev)
+	}
 
-		// Condition and reason
-		if cond, ok := firingFields["condition"]; ok {
-			n.Condition = cond
-		}
-		if reason, ok := firingFields["reason"]; ok {
-			n.Reason = reason
-		}
+	// Condition and reason
+	if cond, ok := firingFields["condition"]; ok {
+		n.Condition = cond
+	}
+	if reason, ok := firingFields["reason"]; ok {
+		n.Reason = reason
+	}
 
-		// Namespace
-		if ns, ok := firingFields["namespace"]; ok {
-			n.Namespace = ns
-		}
+	// Namespace
+	if ns, ok := firingFields["namespace"]; ok {
+		n.Namespace = ns
+	}
 
-		// Cluster name from cluster_deployment
-		if cd, ok := firingFields["cluster_deployment"]; ok {
-			n.ClusterName = cd
-		}
+	// Cluster name from cluster_deployment
+	if cd, ok := firingFields["cluster_deployment"]; ok {
+		n.ClusterName = cd
+	}
 
-		// SOP link: check runbook annotation first, then SOP: in message
-		if runbook, ok := firingFields["runbook"]; ok && runbook != "" {
-			n.SOPLink = runbook
-		} else if msg, ok := firingFields["message"]; ok {
-			sopMatches := sopURLPattern.FindStringSubmatch(msg)
-			if sopMatches != nil {
-				n.SOPLink = sopMatches[1]
-			}
+	// SOP link: check runbook annotation first, then SOP: in message
+	if runbook, ok := firingFields["runbook"]; ok && runbook != "" {
+		n.SOPLink = runbook
+	} else if msg, ok := firingFields["message"]; ok {
+		sopMatches := sopURLPattern.FindStringSubmatch(msg)
+		if sopMatches != nil {
+			n.SOPLink = sopMatches[1]
 		}
+	}
 
-		// Dashboard from annotations
-		if dash, ok := firingFields["dashboard"]; ok {
-			n.DashboardLink = dash
-		}
+	// Dashboard from annotations
+	if dash, ok := firingFields["dashboard"]; ok {
+		n.DashboardLink = dash
+	}
 
-		// Region from firing labels
-		if region, ok := firingFields["region"]; ok {
-			n.Region = region
-		}
+	// Region from firing labels
+	if region, ok := firingFields["region"]; ok {
+		n.Region = region
+	}
 
-		// Cluster ID from firing labels (fallback when not a top-level detail)
-		if n.ClusterID == "" {
-			if cid, ok := firingFields["cluster_id"]; ok {
-				n.ClusterID = cid
-			}
+	// Cluster ID from firing labels (fallback when not a top-level detail)
+	if n.ClusterID == "" {
+		if cid, ok := firingFields["cluster_id"]; ok {
+			n.ClusterID = cid
 		}
 	}
 }
@@ -217,15 +235,12 @@ func parseRHOBSHCP(n *NormalizedAlert, title string, alert pagerduty.IncidentAle
 	n.Region = extractRHOBSRegion(n.ServiceName)
 
 	// Extract namespace and description from firing if available
-	firingText := getDetail("firing", alert)
-	if firingText != "" {
-		firingFields := ParseFiring(firingText)
-		if ns, ok := firingFields["namespace"]; ok {
-			n.Namespace = ns
-		}
-		if desc, ok := firingFields["description"]; ok {
-			n.Description = desc
-		}
+	firingFields := getFiringDetail(alert)
+	if ns, ok := firingFields["namespace"]; ok {
+		n.Namespace = ns
+	}
+	if desc, ok := firingFields["description"]; ok {
+		n.Description = desc
 	}
 }
 

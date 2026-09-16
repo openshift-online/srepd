@@ -209,6 +209,162 @@ Source: https://prometheus.example.com`
 	assert.Equal(t, 1, result.FiringCount)
 }
 
+func TestNormalizeAlert_AppSRE_JSONFiringFormat(t *testing.T) {
+	// Regression test: some app-interface PrometheusRule files deliver the
+	// raw Alertmanager webhook JSON verbatim in the "firing" detail. Because
+	// go-pagerduty decodes IncidentAlert.Body as map[string]interface{}, on
+	// the wire that value arrives pre-decoded as []interface{} — never as a
+	// Go string — so it must be built with decodeJSON here, not a firing
+	// string, for this test to actually exercise the bug (a firing string
+	// would go through ParseFiring directly and never touch the decoded
+	// path). There is deliberately no top-level "cluster_id" detail: for
+	// HCPNodepoolUpgradeDelay-shaped incidents that detail is absent
+	// entirely, so ClusterID must come from the "cluster_id" label inside
+	// firing instead.
+	details := map[string]interface{}{
+		"firing":     decodeJSON(t, appSREJSONFiringText),
+		"num_firing": "1",
+	}
+
+	alert := makeAlert(details)
+
+	serviceSummary := "app-sre-alertmanager"
+	title := "[FIRING:1] ClusterProvisioningDelay - production hivep01ex1 uhc-production-0000aaaa1111bbbb2222cccc3333dddd (stuff here)"
+
+	result := NormalizeAlert(serviceSummary, title, alert)
+
+	assert.Equal(t, "appsre", result.AlertType)
+	assert.Equal(t, "ClusterProvisioningDelay", result.AlertName)
+	assert.Equal(t, "0000aaaa1111bbbb2222cccc3333dddd", result.ClusterID)
+	assert.Equal(t, "high", result.Severity)
+	assert.Equal(t, "ProvisionFailed", result.Condition)
+	assert.Equal(t, "BootstrapFailed", result.Reason)
+	assert.Equal(t, "demo1-abc", result.ClusterName)
+	assert.Equal(t, "https://github.com/openshift/ops-sop/blob/master/v4/alerts/ClusterProvisioningFailure.md", result.SOPLink)
+	assert.Equal(t, "https://grafana.example.com/d/example/example-dashboard?orgId=1", result.DashboardLink)
+	assert.Equal(t, 1, result.FiringCount)
+}
+
+func TestNormalizeAlert_AppSRE_JSONFiringString(t *testing.T) {
+	// Same fixture and assertions as above, but "firing" is a JSON-encoded
+	// Go string rather than pre-decoded — keeps the string-path coverage
+	// (some detail templates may stringify their payload) alongside the
+	// decoded-path test.
+	details := map[string]interface{}{
+		"firing":     appSREJSONFiringText,
+		"num_firing": "1",
+	}
+
+	alert := makeAlert(details)
+
+	serviceSummary := "app-sre-alertmanager"
+	title := "[FIRING:1] ClusterProvisioningDelay - production hivep01ex1 uhc-production-0000aaaa1111bbbb2222cccc3333dddd (stuff here)"
+
+	result := NormalizeAlert(serviceSummary, title, alert)
+
+	assert.Equal(t, "appsre", result.AlertType)
+	assert.Equal(t, "ClusterProvisioningDelay", result.AlertName)
+	assert.Equal(t, "0000aaaa1111bbbb2222cccc3333dddd", result.ClusterID)
+	assert.Equal(t, "high", result.Severity)
+	assert.Equal(t, "ProvisionFailed", result.Condition)
+	assert.Equal(t, "BootstrapFailed", result.Reason)
+	assert.Equal(t, "demo1-abc", result.ClusterName)
+	assert.Equal(t, "https://github.com/openshift/ops-sop/blob/master/v4/alerts/ClusterProvisioningFailure.md", result.SOPLink)
+	assert.Equal(t, "https://grafana.example.com/d/example/example-dashboard?orgId=1", result.DashboardLink)
+	assert.Equal(t, 1, result.FiringCount)
+}
+
+func TestNormalizeAlert_AppSRE_JSONFiring_TopLevelClusterIDWins(t *testing.T) {
+	// When both a top-level "cluster_id" detail and a "cluster_id" label
+	// inside firing exist, the top-level detail wins — parseAppSRE only
+	// falls back to the label when the top-level detail is empty.
+	details := map[string]interface{}{
+		"cluster_id": "top-level-cluster-id",
+		"firing":     decodeJSON(t, appSREJSONFiringText),
+		"num_firing": "1",
+	}
+
+	alert := makeAlert(details)
+
+	result := NormalizeAlert("app-sre-alertmanager", "[FIRING:1] ClusterProvisioningDelay - production", alert)
+
+	assert.Equal(t, "top-level-cluster-id", result.ClusterID)
+}
+
+func TestNormalizeAlert_AppSRE_JSONFiring_SOPFromMessage(t *testing.T) {
+	// No "runbook" annotation: SOP must be extracted from the "SOP: <url>"
+	// pattern inside "message", same fallback the text format uses — this
+	// time with a decoded (non-string) firing value.
+	firing := `[{
+		"labels": {"alertname": "SomeAlert", "severity": "critical"},
+		"annotations": {"message": "Something happened. SOP: https://github.com/openshift/ops-sop/blob/master/v4/alerts/SomeAlert.md"}
+	}]`
+
+	details := map[string]interface{}{
+		"firing":     decodeJSON(t, firing),
+		"num_firing": "1",
+	}
+
+	alert := makeAlert(details)
+
+	result := NormalizeAlert("app-sre-alertmanager", "[FIRING:1] SomeAlert - production (stuff)", alert)
+
+	assert.Equal(t, "appsre", result.AlertType)
+	assert.Equal(t, "https://github.com/openshift/ops-sop/blob/master/v4/alerts/SomeAlert.md", result.SOPLink)
+}
+
+func TestNormalizeAlert_JSONFiring_OtherTypes(t *testing.T) {
+	// OSD Hive and RHOBS HCP also read Namespace/Description via
+	// getFiringDetail — verify a decoded (non-string) firing value works
+	// there too, not just for appsre.
+	osdFiring := `[{"labels": {"namespace": "openshift-sre-pruning"}, "annotations": {"message": "SRE Pruning Job taking too long"}}]`
+	osdAlert := pagerduty.IncidentAlert{
+		Service: pagerduty.APIObject{Summary: "osd-testcluster.p1.openshiftapps.com-hive-cluster"},
+		Body: map[string]interface{}{
+			"details": map[string]interface{}{
+				"alert_name": "PruningCronjobErrorSRE",
+				"firing":     decodeJSON(t, osdFiring),
+			},
+		},
+	}
+	osdResult := NormalizeAlert("osd-testcluster.p1.openshiftapps.com-hive-cluster", "PruningCronjobErrorSRE CRITICAL (1)", osdAlert)
+	assert.Equal(t, "openshift-sre-pruning", osdResult.Namespace)
+	assert.Equal(t, "SRE Pruning Job taking too long", osdResult.Description)
+
+	rhobsFiring := `[{"labels": {"namespace": "ocm-production-abc123"}, "annotations": {"description": "The ingress operator is unavailable"}}]`
+	rhobsAlert := pagerduty.IncidentAlert{
+		Service: pagerduty.APIObject{Summary: "rhobs-hcp-prod-critical-us-west-2"},
+		Body: map[string]interface{}{
+			"details": map[string]interface{}{
+				"alert_name": "ClusterOperatorDown",
+				"firing":     decodeJSON(t, rhobsFiring),
+			},
+		},
+	}
+	rhobsResult := NormalizeAlert("rhobs-hcp-prod-critical-us-west-2", "[HCP] [RHOBS] (Critical) ClusterOperatorDown for HCP: abc123", rhobsAlert)
+	assert.Equal(t, "ocm-production-abc123", rhobsResult.Namespace)
+	assert.Equal(t, "The ingress operator is unavailable", rhobsResult.Description)
+}
+
+func TestNormalizeAlert_MalformedBodies_DoNotPanic(t *testing.T) {
+	malformed := []interface{}{
+		nil,
+		42,
+		[]interface{}{"x"},
+		map[string]interface{}{"labels": "notamap"},
+	}
+
+	for _, firing := range malformed {
+		details := map[string]interface{}{"firing": firing, "num_firing": "1"}
+		a := makeAlert(details)
+
+		assert.NotPanics(t, func() {
+			result := NormalizeAlert("app-sre-alertmanager", "[FIRING:1] SomeAlert - production", a)
+			assert.Equal(t, "", result.SOPLink)
+		})
+	}
+}
+
 func TestNormalizeAlert_AppSRE_SOPFromMessage(t *testing.T) {
 	// Test that SOP is extracted from message annotation when runbook is absent
 	firing := `Labels:
